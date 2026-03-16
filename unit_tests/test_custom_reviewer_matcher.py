@@ -20,6 +20,8 @@ enrich_reviewer_profiles = custom_reviewer_matcher.enrich_reviewer_profiles
 extract_pdf_metadata = custom_reviewer_matcher.extract_pdf_metadata
 _grobid_tei_to_fields = custom_reviewer_matcher._grobid_tei_to_fields
 rank_reviewers = custom_reviewer_matcher.rank_reviewers
+_select_author_rep_papers = custom_reviewer_matcher._select_author_rep_papers
+augment_reviewers_with_author_papers = custom_reviewer_matcher.augment_reviewers_with_author_papers
 
 
 def test_parse_title_abstract_and_references():
@@ -132,6 +134,8 @@ def test_rank_reviewers_orders_by_similarity():
 
     assert ranked[0]["reviewer_id"] == "r1"
     assert ranked[0]["score"] > ranked[1]["score"]
+    assert len(ranked[0]["representative_papers"]) == 1
+    assert ranked[0]["representative_papers"][0]["title"] == "topic-a"
 
 
 def test_package_import_allows_custom_matcher_module():
@@ -144,3 +148,74 @@ def test_package_import_allows_custom_matcher_module():
 
     module = importlib.import_module("expertise.custom_reviewer_matcher")
     assert hasattr(module, "run_pdf_matching")
+
+
+def test_select_author_rep_papers_mixes_cited_and_recent():
+    papers = [
+        {"paperId": "p1", "title": "P1", "abstract": "", "citationCount": 100, "year": 2018},
+        {"paperId": "p2", "title": "P2", "abstract": "", "citationCount": 90, "year": 2019},
+        {"paperId": "p3", "title": "P3", "abstract": "", "citationCount": 5, "year": 2024},
+        {"paperId": "p4", "title": "P4", "abstract": "", "citationCount": 3, "year": 2023},
+    ]
+    selected = _select_author_rep_papers(papers, max_papers=4, top_cited_ratio=0.5)
+    ids = {p.paper_id for p in selected}
+    assert len(selected) == 4
+    assert len(ids) == 4
+    assert {"p1", "p2"}.issubset(ids)
+    assert {"p3", "p4"}.issubset(ids)
+
+
+def test_augment_reviewers_with_author_papers(monkeypatch):
+    reviewers = [ReviewerRecord("123", "Alice", "", "", 1, [PaperRecord("seed", "seed", "")])]
+
+    monkeypatch.setattr(
+        custom_reviewer_matcher,
+        "fetch_semantic_scholar_author_papers",
+        lambda *_args, **_kwargs: [
+            {"paperId": "a", "title": "A", "abstract": "", "citationCount": 10, "year": 2020},
+            {"paperId": "b", "title": "B", "abstract": "", "citationCount": 5, "year": 2024},
+        ],
+    )
+
+    out = augment_reviewers_with_author_papers(reviewers, max_papers=2, top_cited_ratio=0.5)
+    assert out[0].paper_count == 3
+    assert {p.paper_id for p in out[0].papers} == {"a", "b", "seed"}
+
+
+def test_select_author_rep_papers_handles_small_and_overlap_robustly():
+    papers = [
+        {"paperId": "p1", "title": "P1", "abstract": "", "citationCount": 100, "year": 2020},
+        {"paperId": "p2", "title": "P2", "abstract": "", "citationCount": 80, "year": 2021},
+        {"paperId": "p3", "title": "P3", "abstract": "", "citationCount": 60, "year": 2022},
+    ]
+    selected = _select_author_rep_papers(papers, max_papers=20, top_cited_ratio=0.5)
+    assert len(selected) == 3
+    assert len({p.paper_id for p in selected}) == 3
+
+
+
+def test_augment_ensures_referenced_paper_included(monkeypatch):
+    reviewers = [
+        ReviewerRecord(
+            "123",
+            "Alice",
+            "",
+            "",
+            1,
+            [PaperRecord("ref1", "A Very Specific Referenced Paper", "ref abs")],
+        )
+    ]
+
+    monkeypatch.setattr(
+        custom_reviewer_matcher,
+        "fetch_semantic_scholar_author_papers",
+        lambda *_args, **_kwargs: [
+            {"paperId": "x1", "title": "Other Paper", "abstract": "", "citationCount": 100, "year": 2020},
+            {"paperId": "x2", "title": "A Very Specific Referenced Paper v2", "abstract": "matched", "citationCount": 5, "year": 2024},
+        ],
+    )
+
+    out = augment_reviewers_with_author_papers(reviewers, max_papers=1, top_cited_ratio=1.0)
+    titles = [p.title for p in out[0].papers]
+    assert any("A Very Specific Referenced Paper" in t for t in titles)
+
