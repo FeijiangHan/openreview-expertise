@@ -16,6 +16,9 @@ _normalize_reference_title = custom_reviewer_matcher._normalize_reference_title
 build_reviewer_embeddings = custom_reviewer_matcher.build_reviewer_embeddings
 build_reviewer_pool_from_references = custom_reviewer_matcher.build_reviewer_pool_from_references
 parse_title_abstract_references = custom_reviewer_matcher.parse_title_abstract_references
+enrich_reviewer_profiles = custom_reviewer_matcher.enrich_reviewer_profiles
+extract_pdf_metadata = custom_reviewer_matcher.extract_pdf_metadata
+_grobid_tei_to_fields = custom_reviewer_matcher._grobid_tei_to_fields
 rank_reviewers = custom_reviewer_matcher.rank_reviewers
 
 
@@ -45,6 +48,32 @@ def test_normalize_reference_title():
     assert normalized == "Large Language Models for Peer Review"
 
 
+def test_parse_grobid_tei_fields():
+    tei = """<TEI xmlns=\"http://www.tei-c.org/ns/1.0\">
+      <teiHeader>
+        <fileDesc><titleStmt><title>Grobid Title</title></titleStmt></fileDesc>
+        <profileDesc><abstract><p>Abstract line one.</p><p>Line two.</p></abstract></profileDesc>
+      </teiHeader>
+      <text><back><listBibl>
+        <biblStruct><analytic><title>Ref A</title></analytic></biblStruct>
+        <biblStruct><monogr><title>Ref B</title></monogr></biblStruct>
+      </listBibl></back></text>
+    </TEI>"""
+    title, abstract, refs = _grobid_tei_to_fields(tei)
+    assert title == "Grobid Title"
+    assert "Abstract line one." in abstract
+    assert refs == ["Ref A", "Ref B"]
+
+
+def test_extract_pdf_metadata_auto_falls_back(monkeypatch):
+    monkeypatch.setattr(custom_reviewer_matcher, "parse_pdf_with_grobid", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(custom_reviewer_matcher, "extract_text_from_pdf", lambda *_args, **_kwargs: "T\n\nAbstract\nA\n\nReferences\n[1] X. Y. Z.")
+    title, abstract, refs = extract_pdf_metadata(Path("dummy.pdf"), parser="auto")
+    assert title == "T"
+    assert abstract == "A"
+    assert len(refs) == 1
+
+
 def test_build_reviewer_pool_deduplicates(monkeypatch):
     def fake_fetch(title_query, timeout_s=15):
         return {
@@ -59,16 +88,26 @@ def test_build_reviewer_pool_deduplicates(monkeypatch):
 
     monkeypatch.setattr(custom_reviewer_matcher, "fetch_semantic_scholar_paper", fake_fetch)
 
-    pool = build_reviewer_pool_from_references(
-        [
-            "[1] X. Y. Paper 1. Venue.",
-            "[2] X. Y. Paper 1. Venue.",
-        ]
-    )
+    pool = build_reviewer_pool_from_references([
+        "[1] X. Y. Paper 1. Venue.",
+        "[2] X. Y. Paper 1. Venue.",
+    ])
 
     assert len(pool) == 1
     assert pool[0].reviewer_id == "a1"
     assert pool[0].paper_count == 1
+
+
+def test_enrich_reviewer_profiles_openalex(monkeypatch):
+    reviewers = [ReviewerRecord("name::alice", "Alice", "", "", 1, [])]
+    monkeypatch.setattr(
+        custom_reviewer_matcher,
+        "fetch_openalex_author_profile",
+        lambda *_args, **_kwargs: {"affiliation": "MIT", "homepage": "https://mit.edu"},
+    )
+    result = enrich_reviewer_profiles(reviewers, source="openalex")
+    assert result[0].affiliation == "MIT"
+    assert result[0].homepage == "https://mit.edu"
 
 
 class FakeEmbedder:

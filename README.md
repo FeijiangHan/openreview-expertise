@@ -71,6 +71,24 @@ python -m expertise.custom_reviewer_matcher \
 
 注意：该流程默认依赖外部 API 与模型下载，首次运行会拉取 SPECTER2 权重。
 
+稳健化建议与当前实现（已支持）：
+
+- **PDF 结构化解析**：支持 `--pdf-parser auto|grobid|heuristic`，默认 `auto`（优先 GROBID，失败回退 PyMuPDF+启发式）。
+- **审稿人背景 enrich**：支持 `--enrich-source none|openalex|semantic_scholar`，可自动补充机构与主页字段。
+- **网络稳健性**：外部 API 查询内置重试与退避，降低瞬时网络抖动影响。
+
+推荐生产配置：
+
+```bash
+python -m expertise.custom_reviewer_matcher \
+  --pdf /path/to/submission.pdf \
+  --output /path/to/match_result.json \
+  --pdf-parser auto \
+  --grobid-url http://localhost:8070 \
+  --enrich-source openalex \
+  --top-n 20
+```
+
 ## Installation
 
 This repository only supports Python 3.8 and above (Python 3.11 is recommended). Python 3.8 and above is required to run SPECTER2
