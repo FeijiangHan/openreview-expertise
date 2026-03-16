@@ -46,6 +46,49 @@ The following table is partially taken from Stelmakh et al., where SPECTER2, Sci
 |     SciNCL     |  0.22  |      0.90      |      0.65      |
 | SPECTER2+SciNCL|  0.21  |      0.91      |      0.65      |
 
+
+
+## 自定义 PDF 审稿人匹配流程（新增）
+
+仓库新增了 `expertise/custom_reviewer_matcher.py`，用于把本项目作为“匹配引擎”接入你的私有流程：
+
+1. 解析 PDF（通过 PyMuPDF）提取标题、摘要、参考文献。
+2. 基于参考文献调用 Semantic Scholar API 拉取论文与作者信息。
+3. 以作者为主键构建并去重审稿人池（优先 `authorId`，无 ID 时回退到姓名键）。
+4. 使用 SPECTER2 计算投稿与审稿人论文向量并做余弦相似度排序。
+5. 输出 Top-N 审稿人及基础背景字段（name/affiliation/homepage/paper_count）。
+
+示例命令：
+
+```bash
+python -m expertise.custom_reviewer_matcher \
+  --pdf /path/to/submission.pdf \
+  --output /path/to/match_result.json \
+  --top-n 20 \
+  --max-references 50 \
+  --save-reviewer-pool /path/to/reviewer_pool.json
+```
+
+注意：该流程默认依赖外部 API 与模型下载，首次运行会拉取 SPECTER2 权重。
+
+稳健化建议与当前实现（已支持）：
+
+- **PDF 结构化解析**：支持 `--pdf-parser auto|grobid|heuristic`，默认 `auto`（优先 GROBID，失败回退 PyMuPDF+启发式）。
+- **审稿人背景 enrich**：支持 `--enrich-source none|openalex|semantic_scholar`，可自动补充机构与主页字段。
+- **网络稳健性**：外部 API 查询内置重试与退避，降低瞬时网络抖动影响。
+
+推荐生产配置：
+
+```bash
+python -m expertise.custom_reviewer_matcher \
+  --pdf /path/to/submission.pdf \
+  --output /path/to/match_result.json \
+  --pdf-parser auto \
+  --grobid-url http://localhost:8070 \
+  --enrich-source openalex \
+  --top-n 20
+```
+
 ## Installation
 
 This repository only supports Python 3.8 and above (Python 3.11 is recommended). Python 3.8 and above is required to run SPECTER2
