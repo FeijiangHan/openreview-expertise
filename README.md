@@ -46,6 +46,163 @@ The following table is partially taken from Stelmakh et al., where SPECTER2, Sci
 |     SciNCL     |  0.22  |      0.90      |      0.65      |
 | SPECTER2+SciNCL|  0.21  |      0.91      |      0.65      |
 
+
+
+## ➕️ Custom PDF Reviewer Matching Pipeline (Technical Deep Dive)
+
+This repository now includes `expertise/custom_reviewer_matcher.py`, a standalone pipeline that turns **one input PDF** into a ranked reviewer list with transparent evidence.
+
+### ➕️ What this pipeline is for
+
+Use this module when you want to run reviewer matching in a private workflow without relying on OpenReview dataset ingestion.
+
+Input:
+- One submission PDF
+
+Output:
+- `match_result.json` with ranked reviewers (`top_reviewers`), scores, and `representative_papers`
+- Optional reviewer pool snapshot (`--save-reviewer-pool`)
+
+---
+
+### ➕️ End-to-end algorithm (step-by-step)
+
+1. **Parse PDF metadata (title, abstract, references)**
+   - Strategy is controlled by `--pdf-parser {auto,grobid,heuristic}`.
+   - `auto` tries GROBID first, then falls back to PyMuPDF+heuristics.
+   - GROBID mode parses TEI XML (`titleStmt`, `abstract`, `listBibl`).
+   - Heuristic mode extracts title/abstract/reference lines from plain PDF text.
+
+2. **Normalize reference titles**
+   - Each reference string is normalized to a cleaner title query.
+
+3. **Resolve references to papers + authors (Semantic Scholar)**
+   - For each normalized reference title, query Semantic Scholar paper search.
+   - Use the top hit as candidate paper metadata and extract its author list.
+
+4. **Build initial reviewer pool**
+   - Reviewer key priority: `authorId`, fallback to normalized author name key.
+   - Deduplicate reviewers and deduplicate papers per reviewer.
+
+5. **Optional profile enrichment**
+   - `--enrich-source {none,openalex,semantic_scholar}`
+   - Adds affiliation/homepage metadata when available.
+
+6. **Expand each reviewer with representative author papers**
+   - Fetch author papers from Semantic Scholar author endpoint.
+   - Select up to `N=20` papers (`AUTHOR_PAPERS_MAX`) by mixed policy:
+     - `k=0.5` top-cited share (`AUTHOR_TOP_CITED_RATIO`)
+     - `1-k` most recent share
+   - Selection is overlap-safe and backfilled.
+
+7. **Guarantee cited-paper retention (important constraint)**
+   - The papers that originally connected reviewer↔reference are treated as must-include anchors.
+   - If an anchor is missing after top-k selection:
+     - search author paper list by title similarity (`>0.9`), include matched paper;
+     - if still not matched, include original anchor paper directly.
+   - This guarantees traceability from selected reviewers back to cited references.
+
+8. **Compute embeddings and rank reviewers**
+   - Use SPECTER2 proximity adapter for document embeddings.
+   - Build reviewer vector by averaging representative paper embeddings, then normalize.
+   - Embed submission title+abstract and compute cosine similarity against reviewer vectors.
+   - Sort by score and return Top-N.
+
+---
+
+### ➕️ Reproducible runbook
+
+1. Start GROBID (optional but recommended for robust reference parsing):
+
+```bash
+docker run --rm -p 8070:8070 lfoppiano/grobid:0.8.0
+```
+
+2. Run matcher:
+
+```bash
+python -m expertise.custom_reviewer_matcher \
+  --pdf /path/to/submission.pdf \
+  --output /path/to/match_result.json \
+  --save-reviewer-pool /path/to/reviewer_pool.json \
+  --pdf-parser auto \
+  --grobid-url http://localhost:8070 \
+  --enrich-source openalex \
+  --max-references 50 \
+  --top-n 20
+```
+
+3. Inspect result:
+- `submission`: extracted title/abstract used for query embedding
+- `top_reviewers[i].score`: cosine similarity score
+- `top_reviewers[i].representative_papers`: paper titles/abstracts used for that reviewer embedding
+
+---
+
+### ➕️ `match_result.json` structure (debug-oriented)
+
+```json
+{
+  "submission": {"title": "...", "abstract": "..."},
+  "reference_count": 42,
+  "reviewer_pool_size": 380,
+  "enrich_source": "openalex",
+  "pdf_parser": "auto",
+  "top_reviewers": [
+    {
+      "reviewer_id": "1234567",
+      "name": "...",
+      "affiliation": "...",
+      "homepage": "...",
+      "paper_count": 20,
+      "score": 0.83,
+      "representative_papers": [
+        {"paper_id": "...", "title": "...", "abstract": "..."}
+      ]
+    }
+  ]
+}
+```
+
+---
+
+### ➕️ External APIs and matching details
+
+- **Semantic Scholar paper search**: resolves reference title → paper + authors.
+- **Semantic Scholar author papers**: expands each reviewer into richer publication evidence.
+- **OpenAlex author search** (optional): enriches metadata like institution/homepage.
+- HTTP requests use retry/backoff for transient failure tolerance.
+
+---
+
+### ➕️ Logging and failure localization
+
+The CLI prints concise progress logs with `[custom-matcher]` prefix, including:
+- PDF page progress
+- parser branch chosen (`grobid` vs fallback)
+- reference/title previews
+- API query status
+- reviewer pool growth
+- embedding/ranking stages
+
+This is intentionally designed so you can quickly identify which stage failed.
+
+---
+
+### ➕️ Accuracy notes (important)
+
+This pipeline is robust and traceable, but not mathematically guaranteed to be perfectly accurate in all cases. Main uncertainty sources:
+- PDF layout noise (especially scanned PDFs)
+- reference string quality
+- external API retrieval/disambiguation
+- author name collisions when IDs are missing
+
+Recommended production hardening:
+- Prefer GROBID in `auto` mode
+- Keep title-similarity retention enabled
+- Add local caching for API responses
+- Periodically evaluate precision with a manually verified benchmark set
+
 ## Installation
 
 This repository only supports Python 3.8 and above (Python 3.11 is recommended). Python 3.8 and above is required to run SPECTER2
