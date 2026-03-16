@@ -7,11 +7,39 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+
+def _log(message: str) -> None:
+    print(f"[custom-matcher] {message}")
+
+
+def _preview(text: str, limit: int = 200) -> str:
+    normalized = re.sub(r"\s+", " ", (text or "")).strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[:limit] + "..."
+
+
+def _title_similarity(title_a: str, title_b: str) -> float:
+    a = re.sub(r"\s+", " ", (title_a or "")).strip().lower()
+    b = re.sub(r"\s+", " ", (title_b or "")).strip().lower()
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _contains_title(records: Sequence["PaperRecord"], title: str, threshold: float = 0.9) -> bool:
+    return any(_title_similarity(r.title, title) >= threshold for r in records)
+
+
+AUTHOR_PAPERS_MAX = 20
+AUTHOR_TOP_CITED_RATIO = 0.5
 
 
 @dataclass
@@ -44,6 +72,7 @@ def _request_json(
     retries: int = 2,
     retry_sleep_s: float = 0.5,
 ) -> Optional[Dict]:
+    _log(f"HTTP {method} {url}")
     req = urllib.request.Request(
         url,
         data=data,
@@ -54,8 +83,11 @@ def _request_json(
     for attempt in range(retries + 1):
         try:
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                payload = json.loads(resp.read().decode("utf-8"))
+                _log(f"HTTP success: {url}")
+                return payload
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, urllib.error.HTTPError):
+            _log(f"HTTP failed (attempt {attempt + 1}/{retries + 1}): {url}")
             if attempt >= retries:
                 return None
             time.sleep(retry_sleep_s * (attempt + 1))
@@ -72,9 +104,13 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
         ) from exc
 
     text_parts: List[str] = []
+    _log(f"Opening PDF: {pdf_path}")
     with fitz.open(str(pdf_path)) as doc:
-        for page in doc:
+        total_pages = len(doc)
+        _log(f"PDF pages: {total_pages}")
+        for idx, page in enumerate(doc, start=1):
             text_parts.append(page.get_text("text"))
+            _log(f"Parsed page {idx}/{total_pages}")
 
     text = "\n".join(text_parts).strip()
     if not text:
@@ -123,11 +159,15 @@ def _grobid_tei_to_fields(tei_xml: str) -> Tuple[str, str, List[str]]:
         if ref_title:
             references.append(ref_title)
 
+    _log(
+        f"GROBID parsed title='{_preview(title, 120)}', abstract_preview='{_preview(abstract, 160)}', refs={len(references)}"
+    )
     return title, abstract, references
 
 
 def parse_pdf_with_grobid(pdf_path: Path, grobid_url: str, timeout_s: int = 60) -> Optional[Tuple[str, str, List[str]]]:
     endpoint = grobid_url.rstrip("/") + "/api/processFulltextDocument"
+    _log(f"Trying GROBID parser: {endpoint}")
     body, content_type = _build_multipart_pdf_request(pdf_path)
     req = urllib.request.Request(
         endpoint,
@@ -142,10 +182,12 @@ def parse_pdf_with_grobid(pdf_path: Path, grobid_url: str, timeout_s: int = 60) 
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             xml_payload = resp.read().decode("utf-8", errors="ignore")
+        _log("GROBID request succeeded")
         parsed = _grobid_tei_to_fields(xml_payload)
         if parsed[0] or parsed[1] or parsed[2]:
             return parsed
     except (urllib.error.URLError, TimeoutError, ET.ParseError):
+        _log("GROBID request/parse failed, will fallback if allowed")
         return None
     return None
 
@@ -180,6 +222,11 @@ def parse_title_abstract_references(pdf_text: str) -> Tuple[str, str, List[str]]
         abstract = " ".join(abstract_lines).strip()
 
     references = _extract_reference_lines(lines)
+    _log(
+        f"Heuristic parsed title='{_preview(title, 120)}', abstract_preview='{_preview(abstract, 160)}', refs={len(references)}"
+    )
+    if references:
+        _log(f"Reference preview: '{_preview(' | '.join(references[:3]), 260)}'")
     return title, abstract, references
 
 
@@ -222,13 +269,16 @@ def extract_pdf_metadata(
     if parser not in {"auto", "grobid", "heuristic"}:
         raise ValueError("parser must be one of: auto, grobid, heuristic")
 
+    _log(f"PDF parse strategy: {parser}")
     if parser in {"auto", "grobid"}:
         grobid_data = parse_pdf_with_grobid(pdf_path, grobid_url)
         if grobid_data is not None:
+            _log("Using GROBID parse result")
             return grobid_data
         if parser == "grobid":
             raise PDFExtractionError("GROBID parsing failed; check grobid_url/service health")
 
+    _log("Using heuristic PDF parser fallback")
     pdf_text = extract_text_from_pdf(pdf_path)
     return parse_title_abstract_references(pdf_text)
 
@@ -248,6 +298,7 @@ def _normalize_reference_title(reference_line: str) -> str:
 
 
 def fetch_semantic_scholar_paper(title_query: str, timeout_s: int = 15) -> Optional[Dict]:
+    _log(f"Searching paper by title: '{_preview(title_query, 120)}'")
     encoded_query = urllib.parse.quote(title_query)
     fields = urllib.parse.quote("paperId,title,abstract,authors")
     url = (
@@ -256,9 +307,17 @@ def fetch_semantic_scholar_paper(title_query: str, timeout_s: int = 15) -> Optio
     )
     payload = _request_json(url, timeout_s=timeout_s)
     if not payload:
+        _log("Semantic Scholar paper search returned no payload")
         return None
     data = payload.get("data") or []
-    return data[0] if data else None
+    if not data:
+        _log("Semantic Scholar paper search returned empty data")
+        return None
+    top = data[0]
+    _log(
+        f"Paper hit: title='{_preview(top.get('title', ''), 120)}', authors={len(top.get('authors') or [])}"
+    )
+    return top
 
 
 def fetch_semantic_scholar_author_profile(author_id: str, timeout_s: int = 15) -> Optional[Dict]:
@@ -293,16 +352,138 @@ def fetch_openalex_author_profile(author_name: str, timeout_s: int = 15) -> Opti
     }
 
 
+def fetch_semantic_scholar_author_papers(author_id: str, timeout_s: int = 20, limit: int = 100) -> List[Dict]:
+    if not author_id.isdigit():
+        return []
+    fields = urllib.parse.quote("paperId,title,abstract,citationCount,year")
+    url = (
+        f"https://api.semanticscholar.org/graph/v1/author/{urllib.parse.quote(author_id)}/papers"
+        f"?fields={fields}&limit={limit}"
+    )
+    payload = _request_json(url, timeout_s=timeout_s)
+    if not payload:
+        return []
+    papers = payload.get("data") or []
+    _log(f"Fetched {len(papers)} papers for author_id={author_id}")
+    return papers
+
+
+def _select_author_rep_papers(
+    papers: Sequence[Dict], max_papers: int = AUTHOR_PAPERS_MAX, top_cited_ratio: float = AUTHOR_TOP_CITED_RATIO
+) -> List[PaperRecord]:
+    if not papers:
+        return []
+
+    clean = [p for p in papers if (p.get("title") or "").strip()]
+    if not clean:
+        return []
+
+    total_target = min(max_papers, len(clean))
+    top_cited_n = int(round(total_target * top_cited_ratio))
+    top_cited_n = max(1, min(total_target, top_cited_n))
+    recent_n = total_target - top_cited_n
+
+    sorted_by_cited = sorted(
+        clean,
+        key=lambda p: (int(p.get("citationCount") or 0), int(p.get("year") or 0)),
+        reverse=True,
+    )
+    sorted_by_recent = sorted(
+        clean,
+        key=lambda p: (int(p.get("year") or 0), int(p.get("citationCount") or 0)),
+        reverse=True,
+    )
+
+    chosen: List[Dict] = []
+    chosen_ids = set()
+
+    def _try_add(source: Sequence[Dict], limit: int) -> None:
+        for p in source:
+            if len(chosen) >= limit:
+                break
+            pid = str(p.get("paperId") or p.get("title"))
+            if pid in chosen_ids:
+                continue
+            chosen.append(p)
+            chosen_ids.add(pid)
+
+    # Step 1: top-cited quota (dynamic by available papers)
+    _try_add(sorted_by_cited, top_cited_n)
+
+    # Step 2: recent quota from remaining papers (no overlap)
+    target_after_recent = top_cited_n + recent_n
+    _try_add(sorted_by_recent, target_after_recent)
+
+    # Step 3: if any quota still unmet due to overlap, backfill by citation order
+    _try_add(sorted_by_cited, total_target)
+
+    records: List[PaperRecord] = []
+    for p in chosen[:total_target]:
+        records.append(
+            PaperRecord(
+                paper_id=str(p.get("paperId") or p.get("title") or ""),
+                title=(p.get("title") or "").strip(),
+                abstract=(p.get("abstract") or "").strip(),
+            )
+        )
+    return records
+
+
+def augment_reviewers_with_author_papers(
+    reviewers: Sequence[ReviewerRecord],
+    max_papers: int = AUTHOR_PAPERS_MAX,
+    top_cited_ratio: float = AUTHOR_TOP_CITED_RATIO,
+) -> List[ReviewerRecord]:
+    _log(
+        f"Augmenting reviewer papers from author profiles: reviewers={len(reviewers)}, max_papers={max_papers}, top_cited_ratio={top_cited_ratio}"
+    )
+    for reviewer in reviewers:
+        must_include = list(reviewer.papers)
+        papers = fetch_semantic_scholar_author_papers(reviewer.reviewer_id)
+        selected = _select_author_rep_papers(papers, max_papers=max_papers, top_cited_ratio=top_cited_ratio)
+
+        # Ensure each originally referenced paper appears in final representative list.
+        for must in must_include:
+            if _contains_title(selected, must.title, threshold=0.9):
+                continue
+
+            matched = None
+            for p in papers:
+                p_title = (p.get("title") or "").strip()
+                if _title_similarity(must.title, p_title) >= 0.9:
+                    matched = PaperRecord(
+                        paper_id=str(p.get("paperId") or p_title or ""),
+                        title=p_title,
+                        abstract=(p.get("abstract") or "").strip(),
+                    )
+                    break
+
+            if matched is None:
+                matched = must
+
+            if not _contains_title(selected, matched.title, threshold=0.9):
+                selected.append(matched)
+
+        if selected:
+            reviewer.papers = selected
+            reviewer.paper_count = len(selected)
+        _log(f"Reviewer '{_preview(reviewer.name,80)}' final papers={len(reviewer.papers)}")
+    return list(reviewers)
+
+
 def build_reviewer_pool_from_references(reference_lines: Sequence[str], max_references: int = 30) -> List[ReviewerRecord]:
+    _log(f"Building reviewer pool from references: total={len(reference_lines)}, max_used={max_references}")
     reviewer_map: Dict[str, ReviewerRecord] = {}
 
-    for ref_line in reference_lines[:max_references]:
+    for idx, ref_line in enumerate(reference_lines[:max_references], start=1):
+        _log(f"Processing reference {idx}: '{_preview(ref_line, 180)}'")
         query_title = _normalize_reference_title(ref_line)
         if not query_title:
             continue
 
         paper = fetch_semantic_scholar_paper(query_title)
         if not paper:
+            _log("No paper found for reference")
             continue
 
         paper_title = (paper.get("title") or "").strip()
@@ -338,7 +519,9 @@ def build_reviewer_pool_from_references(reference_lines: Sequence[str], max_refe
                 reviewer.papers.append(paper_record)
                 reviewer.paper_count += 1
 
-    return list(reviewer_map.values())
+    reviewers = list(reviewer_map.values())
+    _log(f"Reviewer pool built: {len(reviewers)} unique reviewers")
+    return reviewers
 
 
 def enrich_reviewer_profiles(reviewers: Sequence[ReviewerRecord], source: str = "openalex") -> List[ReviewerRecord]:
@@ -347,8 +530,10 @@ def enrich_reviewer_profiles(reviewers: Sequence[ReviewerRecord], source: str = 
         raise ValueError("source must be one of: none, openalex, semantic_scholar")
 
     if source == "none":
+        _log("Reviewer profile enrichment disabled")
         return list(reviewers)
 
+    _log(f"Enriching reviewer profiles using source='{source}' (count={len(reviewers)})")
     for reviewer in reviewers:
         try:
             profile = None
@@ -364,7 +549,11 @@ def enrich_reviewer_profiles(reviewers: Sequence[ReviewerRecord], source: str = 
                 if profile:
                     reviewer.affiliation = (profile.get("affiliation") or reviewer.affiliation).strip()
                     reviewer.homepage = (profile.get("homepage") or reviewer.homepage).strip()
+            _log(
+                f"Enriched reviewer '{reviewer.name}': affiliation='{_preview(reviewer.affiliation, 80)}', homepage='{_preview(reviewer.homepage, 80)}'"
+            )
         except Exception:
+            _log(f"Profile enrichment failed for reviewer '{reviewer.name}'")
             continue
 
     return list(reviewers)
@@ -438,7 +627,8 @@ def build_reviewer_embeddings(
     batch_size: int = 8,
 ) -> Dict[str, np.ndarray]:
     reviewer_embeddings: Dict[str, np.ndarray] = {}
-    for reviewer in reviewers:
+    _log(f"Building reviewer embeddings for {len(reviewers)} reviewers")
+    for idx, reviewer in enumerate(reviewers, start=1):
         paper_texts = [_paper_to_text(p.title, p.abstract) for p in reviewer.papers]
         paper_texts = [t for t in paper_texts if t]
         if not paper_texts:
@@ -450,6 +640,7 @@ def build_reviewer_embeddings(
         if norm == 0:
             continue
         reviewer_embeddings[reviewer.reviewer_id] = mean_vector / norm
+        _log(f"Reviewer embedding done {idx}/{len(reviewers)}: '{_preview(reviewer.name, 80)}' papers={len(paper_texts)}")
 
     return reviewer_embeddings
 
@@ -462,6 +653,9 @@ def rank_reviewers(
     embedder: Specter2Embedder,
     top_n: int = 10,
 ) -> List[Dict]:
+    _log(
+        f"Ranking reviewers for submission title='{_preview(submission_title, 120)}', abstract_preview='{_preview(submission_abstract, 140)}'"
+    )
     submission_vec = embedder.encode_texts([_paper_to_text(submission_title, submission_abstract)])[0]
     submission_norm = np.linalg.norm(submission_vec)
     if submission_norm == 0:
@@ -482,10 +676,23 @@ def rank_reviewers(
                 "homepage": reviewer.homepage,
                 "paper_count": reviewer.paper_count,
                 "score": score,
+                "representative_papers": [
+                    {
+                        "paper_id": p.paper_id,
+                        "title": p.title,
+                        "abstract": p.abstract,
+                    }
+                    for p in reviewer.papers
+                ],
             }
         )
 
     rows.sort(key=lambda r: r["score"], reverse=True)
+    if rows:
+        top = rows[0]
+        _log(
+            f"Top reviewer preview: name='{_preview(top['name'], 80)}', score={round(top['score'], 4)}, affiliation='{_preview(top.get('affiliation', ''), 80)}'"
+        )
     return rows[:top_n]
 
 
@@ -515,13 +722,20 @@ def run_pdf_matching(
     grobid_url: str = "http://localhost:8070",
     enrich_source: str = "openalex",
 ) -> Tuple[Dict, List[ReviewerRecord]]:
+    _log("Starting PDF reviewer matching pipeline")
     title, abstract, references = extract_pdf_metadata(pdf_path, parser=pdf_parser, grobid_url=grobid_url)
+    _log(f"Submission parsed: title='{_preview(title, 120)}', refs={len(references)}")
 
     reviewers = build_reviewer_pool_from_references(references, max_references=max_references)
     if not reviewers:
         raise RuntimeError("No reviewers could be built from PDF references")
 
     reviewers = enrich_reviewer_profiles(reviewers, source=enrich_source)
+    reviewers = augment_reviewers_with_author_papers(
+        reviewers,
+        max_papers=AUTHOR_PAPERS_MAX,
+        top_cited_ratio=AUTHOR_TOP_CITED_RATIO,
+    )
 
     embedder = Specter2Embedder(use_cuda=False)
     reviewer_embeddings = build_reviewer_embeddings(reviewers, embedder)
@@ -536,6 +750,7 @@ def run_pdf_matching(
         "top_reviewers": ranked,
     }
     output_path.write_text(json.dumps(response, indent=2, ensure_ascii=False), encoding="utf-8")
+    _log(f"Pipeline finished. Results written to: {output_path}")
     return response, reviewers
 
 

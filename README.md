@@ -76,6 +76,9 @@ python -m expertise.custom_reviewer_matcher \
 - **PDF 结构化解析**：支持 `--pdf-parser auto|grobid|heuristic`，默认 `auto`（优先 GROBID，失败回退 PyMuPDF+启发式）。
 - **审稿人背景 enrich**：支持 `--enrich-source none|openalex|semantic_scholar`，可自动补充机构与主页字段。
 - **网络稳健性**：外部 API 查询内置重试与退避，降低瞬时网络抖动影响。
+- **作者论文扩展策略**：每位作者默认额外拉取代表作并固定采样 20 篇用于 embedding，其中 50% 来自高引用论文、50% 来自最新论文（当前固定常量，后续可参数化）。
+- **引用论文保留约束**：若作者最终代表作中缺失输入论文引用的目标论文，会基于作者论文全集做标题相似度匹配（>0.9）补入；若仍未命中则保留原引用论文，确保可追溯。
+- **结果可调试性**：`match_result.json` 的每位候选审稿人都包含 `representative_papers`（title+abstract），便于核查匹配依据。
 
 推荐生产配置：
 
