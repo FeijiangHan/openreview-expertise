@@ -62,11 +62,11 @@ The following table is partially taken from Stelmakh et al., where SPECTER2, Sci
 
 ```bash
 python -m expertise.custom_reviewer_matcher \
-  --pdf /path/to/submission.pdf \
-  --output /path/to/match_result.json \
+  --pdf tests/data/pdfs/ZeroTuning.pdf \
+  --output match_result.json \
   --top-n 20 \
   --max-references 50 \
-  --save-reviewer-pool /path/to/reviewer_pool.json
+  --save-reviewer-pool reviewer_pool.json
 ```
 
 注意：该流程默认依赖外部 API 与模型下载，首次运行会拉取 SPECTER2 权重。
