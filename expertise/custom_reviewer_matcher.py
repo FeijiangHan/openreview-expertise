@@ -2,7 +2,6 @@ import argparse
 import json
 import re
 import time
-import warnings
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -573,23 +572,9 @@ class Specter2Embedder:
         self._torch = torch
         self.tokenizer = AutoTokenizer.from_pretrained("allenai/specter2_aug2023refresh_base")
         self.model = AutoAdapterModel.from_pretrained("allenai/specter2_aug2023refresh_base")
-        adapter_name = self.model.load_adapter(
+        self.model.load_adapter(
             "allenai/specter2_aug2023refresh", source="hf", load_as="proximity", set_active=True
         )
-        # adapters>=1.x can ignore set_active in some combinations; enforce active adapter explicitly.
-        try:
-            active_name = adapter_name if adapter_name else "proximity"
-            self.model.set_active_adapters(active_name)
-        except Exception:
-            try:
-                self.model.active_adapters = "proximity"
-            except Exception:
-                pass
-        if not getattr(self.model, "active_adapters", None):
-            warnings.warn(
-                "SPECTER2 adapter loaded but not active; embeddings may fallback to base model.",
-                RuntimeWarning,
-            )
         self.device = torch.device("cuda:0") if use_cuda else torch.device("cpu")
         self.model.to(self.device)
         self.model.eval()
