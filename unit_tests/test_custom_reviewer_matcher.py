@@ -132,3 +132,15 @@ def test_rank_reviewers_orders_by_similarity():
 
     assert ranked[0]["reviewer_id"] == "r1"
     assert ranked[0]["score"] > ranked[1]["score"]
+
+
+def test_package_import_allows_custom_matcher_module():
+    import importlib
+    import sys
+
+    repo_root = str(Path(__file__).resolve().parents[1])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
+    module = importlib.import_module("expertise.custom_reviewer_matcher")
+    assert hasattr(module, "run_pdf_matching")
